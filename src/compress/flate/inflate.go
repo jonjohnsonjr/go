@@ -23,6 +23,11 @@ const (
 	maxNumLit  = 286
 	maxNumDist = 30
 	numCodes   = 19 // number of codes in Huffman meta-code
+
+	// maxLengthCode is the largest valid length code. The RFC (section 3.2.5)
+	// defines literal/length codes 286 and 287, but they may not appear in
+	// compressed data.
+	maxLengthCode = lengthCodesStart + 28
 )
 
 // Initialize the fixedHuffmanDecoder only once upon first use.
@@ -278,7 +283,7 @@ type decompressor struct {
 	nfed int    // peeked bytes fed into the bit buffer but not yet consumed
 
 	// Input bits, in top of b.
-	b  uint32
+	b  uint64
 	nb uint
 
 	// Huffman decoders for literal/length, distance.
@@ -456,7 +461,7 @@ func (f *decompressor) readHuffman() error {
 				return err
 			}
 		}
-		rep += int(f.b & uint32(1<<nb-1))
+		rep += int(f.b & uint64(1<<nb-1))
 		f.b >>= nb
 		f.nb -= nb
 		if i+rep > n {
@@ -483,6 +488,20 @@ func (f *decompressor) readHuffman() error {
 	return nil
 }
 
+// distBase[i] and distExtraBits[i] are the base distance and the number
+// of extra bits for distance code i. See RFC section 3.2.5.
+var distBase = [maxNumDist]uint16{
+	1, 2, 3, 4, 5, 7, 9, 13, 17, 25,
+	33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+	1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+}
+
+var distExtraBits = [maxNumDist]uint8{
+	0, 0, 0, 0, 1, 1, 2, 2, 3, 3,
+	4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+	9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+}
+
 // Decode a single Huffman block from f.
 // hl and hd are the Huffman states for the lit/length values
 // and the distance values, respectively. If hd == nil, using the
@@ -501,17 +520,179 @@ func (f *decompressor) huffmanBlock() {
 	}
 
 readLiteral:
-	// Read literal and/or (length, distance) according to RFC section 3.2.3.
+	// Read literals and/or (length, distance) pairs according to
+	// RFC section 3.2.3.
+	//
+	// This is the fast path, and it is performance critical. It runs while
+	// the peek window holds at least 8 more bytes. Every iteration refills
+	// the bit buffer to at least 56 bits with a single 8-byte load, which
+	// covers the longest possible literal/length code, distance code and
+	// extra bits (15+5+15+13 = 48 bits), so the symbol decoding itself never
+	// has to check for or read more input. The decoder state is kept in
+	// local variables throughout, and is stored back to f on the single exit
+	// path below. Bytes that were loaded into the bit buffer but not consumed
+	// are returned to the peek window there, so that the input position is
+	// the same as if bytes had been read one at a time as needed.
+	{
+		const (
+			exitSlow = iota // fast path unavailable, decode one symbol slowly
+			exitCorrupt
+			exitEndBlock
+			exitFlush // output window is full
+			exitCopy  // copy does not fit in the window; finish in copyHistory
+		)
+		exit := exitSlow
+
+		hl, hd := f.hl, f.hd
+		b, nb := f.b, f.nb
+		pb, pi, nfed := f.pb, 0, f.nfed
+		hist, wrPos, full := f.dict.hist, f.dict.wrPos, f.dict.full
+		var length, dist int
+		for len(pb)-pi >= 8 {
+			// Refill the bit buffer to 56-63 bits. The load may bring in
+			// bits beyond those accounted for by nb; they are the bits of
+			// the following input bytes, in their proper positions, so they
+			// are simply loaded again by a later refill.
+			b |= loadLE64(pb, pi) << (nb & 63)
+			pi += 7 - int(nb>>3)
+			nb |= 56
+
+			// Decode the literal/length symbol.
+			chunk := hl.chunks[b&(huffmanNumChunks-1)]
+			n := uint(chunk & huffmanCountMask)
+			if n > huffmanChunkBits {
+				chunk = hl.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hl.linkMask]
+				n = uint(chunk & huffmanCountMask)
+			}
+			if n == 0 {
+				exit = exitCorrupt
+				break
+			}
+			b >>= n & 63
+			nb -= n
+			v := int(chunk >> huffmanValueShift)
+			if v < 256 {
+				hist[wrPos] = byte(v)
+				wrPos++
+				if wrPos == len(hist) {
+					exit = exitFlush
+					break
+				}
+				continue
+			}
+			if v == 256 {
+				exit = exitEndBlock
+				break
+			}
+			if v > maxLengthCode {
+				exit = exitCorrupt
+				break
+			}
+			v -= lengthCodesStart
+			n = uint(lengthExtraBits[v])
+			length = int(lengthBase[v]) + 3 + int(b&(1<<n-1))
+			b >>= n & 63
+			nb -= n
+
+			// Decode the distance symbol.
+			if hd == nil {
+				dist = int(bits.Reverse8(uint8(b&0x1F) << 3))
+				b >>= 5
+				nb -= 5
+			} else {
+				chunk = hd.chunks[b&(huffmanNumChunks-1)]
+				n = uint(chunk & huffmanCountMask)
+				if n > huffmanChunkBits {
+					chunk = hd.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hd.linkMask]
+					n = uint(chunk & huffmanCountMask)
+				}
+				if n == 0 {
+					exit = exitCorrupt
+					break
+				}
+				b >>= n & 63
+				nb -= n
+				dist = int(chunk >> huffmanValueShift)
+			}
+			if dist >= maxNumDist {
+				exit = exitCorrupt
+				break
+			}
+			n = uint(distExtraBits[dist])
+			dist = int(distBase[dist]) + int(b&(1<<n-1))
+			b >>= n & 63
+			nb -= n
+
+			// Perform a backwards copy according to RFC section 3.2.3.
+			// No check on length; encoding can be prescient.
+			if dist > wrPos {
+				if !full {
+					exit = exitCorrupt
+					break
+				}
+				// The source wraps around the window.
+				exit = exitCopy
+				break
+			}
+			if wrPos+length > len(hist) {
+				exit = exitCopy
+				break
+			}
+			// Common case: the copy fits in the window without wrapping,
+			// so it can be done in place. Source and destination overlap
+			// if length is larger than dist, so copy in non-overlapping
+			// chunks.
+			srcPos, endPos := wrPos-dist, wrPos+length
+			for wrPos < endPos {
+				wrPos += copy(hist[wrPos:endPos], hist[srcPos:wrPos])
+			}
+			if wrPos == len(hist) {
+				exit = exitFlush
+				break
+			}
+		}
+
+		// Return the whole bytes that were loaded but not consumed to the
+		// peek window, and store the state back. The bit buffer may have
+		// held more than 8 bits on entry (see the note on h1.min in
+		// readHuffman), so only bytes loaded by this loop are returned.
+		k := min(int(nb>>3), pi)
+		pi -= k
+		nb -= 8 * uint(k)
+		b &= 1<<nb - 1
+		nfed += pi
+		f.b, f.nb = b, nb
+		f.pb, f.nfed = pb[pi:], nfed
+		f.dict.wrPos = wrPos
+
+		switch exit {
+		case exitCorrupt:
+			f.err = CorruptInputError(f.roffset + int64(nfed))
+			return
+		case exitEndBlock:
+			f.finishBlock()
+			return
+		case exitFlush:
+			f.toRead = f.dict.readFlush()
+			f.step = (*decompressor).huffmanBlock
+			f.stepState = stateInit
+			return
+		case exitCopy:
+			f.copyLen, f.copyDist = length, dist
+			goto copyHistory
+		}
+	}
+
+	// Slow path: decode a single symbol, reading input one byte at a time
+	// and only as needed. This is used when the input does not support
+	// peeking, and when the peek window is nearly exhausted.
 	{
 		v, err := f.huffSym(f.hl)
 		if err != nil {
 			f.err = err
 			return
 		}
-		var n uint // number of bits extra
-		var length int
-		switch {
-		case v < 256:
+		if v < 256 {
 			f.dict.writeByte(byte(v))
 			if f.dict.availWrite() == 0 {
 				f.toRead = f.dict.readFlush()
@@ -520,95 +701,50 @@ readLiteral:
 				return
 			}
 			goto readLiteral
-		case v == 256:
+		}
+		if v == 256 {
 			f.finishBlock()
 			return
-		// otherwise, reference to older data
-		case v < 265:
-			length = v - (257 - 3)
-			n = 0
-		case v < 269:
-			length = v*2 - (265*2 - 11)
-			n = 1
-		case v < 273:
-			length = v*4 - (269*4 - 19)
-			n = 2
-		case v < 277:
-			length = v*8 - (273*8 - 35)
-			n = 3
-		case v < 281:
-			length = v*16 - (277*16 - 67)
-			n = 4
-		case v < 285:
-			length = v*32 - (281*32 - 131)
-			n = 5
-		case v < maxNumLit:
-			length = 258
-			n = 0
-		default:
+		}
+		if v > maxLengthCode {
 			f.err = CorruptInputError(f.roffset + int64(f.nfed))
 			return
 		}
-		if n > 0 {
-			for f.nb < n {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			length += int(f.b & uint32(1<<n-1))
-			f.b >>= n
-			f.nb -= n
+		v -= lengthCodesStart
+		extra, err := f.readBits(uint(lengthExtraBits[v]))
+		if err != nil {
+			f.err = err
+			return
 		}
+		length := int(lengthBase[v]) + 3 + int(extra)
 
 		var dist int
 		if f.hd == nil {
-			for f.nb < 5 {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			dist = int(bits.Reverse8(uint8(f.b & 0x1F << 3)))
-			f.b >>= 5
-			f.nb -= 5
-		} else {
-			if dist, err = f.huffSym(f.hd); err != nil {
+			if extra, err = f.readBits(5); err != nil {
 				f.err = err
 				return
 			}
+			dist = int(bits.Reverse8(uint8(extra) << 3))
+		} else if dist, err = f.huffSym(f.hd); err != nil {
+			f.err = err
+			return
 		}
-
-		switch {
-		case dist < 4:
-			dist++
-		case dist < maxNumDist:
-			nb := uint(dist-2) >> 1
-			// have 1 bit in bottom of dist, need nb more.
-			extra := (dist & 1) << nb
-			for f.nb < nb {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			extra |= int(f.b & uint32(1<<nb-1))
-			f.b >>= nb
-			f.nb -= nb
-			dist = 1<<(nb+1) + 1 + extra
-		default:
+		if dist >= maxNumDist {
 			f.err = CorruptInputError(f.roffset + int64(f.nfed))
 			return
 		}
+		if extra, err = f.readBits(uint(distExtraBits[dist])); err != nil {
+			f.err = err
+			return
+		}
+		dist = int(distBase[dist]) + int(extra)
 
 		// No check on length; encoding can be prescient.
 		if dist > f.dict.histSize() {
 			f.err = CorruptInputError(f.roffset + int64(f.nfed))
 			return
 		}
-
 		f.copyLen, f.copyDist = length, dist
-		goto copyHistory
 	}
 
 copyHistory:
@@ -708,6 +844,7 @@ func noEOF(e error) error {
 	return e
 }
 
+// moreBits reads the next input byte into the bit buffer.
 func (f *decompressor) moreBits() error {
 	if f.pr != nil {
 		if len(f.pb) == 0 {
@@ -715,7 +852,7 @@ func (f *decompressor) moreBits() error {
 				return err
 			}
 		}
-		f.b |= uint32(f.pb[0]) << (f.nb & 31)
+		f.b |= uint64(f.pb[0]) << (f.nb & 63)
 		f.pb = f.pb[1:]
 		f.nfed++
 		f.nb += 8
@@ -726,9 +863,22 @@ func (f *decompressor) moreBits() error {
 		return noEOF(err)
 	}
 	f.roffset++
-	f.b |= uint32(c) << f.nb
+	f.b |= uint64(c) << (f.nb & 63)
 	f.nb += 8
 	return nil
+}
+
+// readBits returns the next n bits of input, for n <= 16.
+func (f *decompressor) readBits(n uint) (uint32, error) {
+	for f.nb < n {
+		if err := f.moreBits(); err != nil {
+			return 0, err
+		}
+	}
+	v := uint32(f.b) & (1<<n - 1)
+	f.b >>= n & 63
+	f.nb -= n
+	return v, nil
 }
 
 // Read the next Huffman-encoded symbol from f according to h.
@@ -752,7 +902,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 						return 0, err
 					}
 				}
-				b |= uint32(f.pb[0]) << (nb & 31)
+				b |= uint64(f.pb[0]) << (nb & 63)
 				f.pb = f.pb[1:]
 				f.nfed++
 				nb += 8
@@ -765,13 +915,13 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 				return 0, noEOF(err)
 			}
 			f.roffset++
-			b |= uint32(c) << (nb & 31)
+			b |= uint64(c) << (nb & 63)
 			nb += 8
 		}
 		chunk := h.chunks[b&(huffmanNumChunks-1)]
 		n = uint(chunk & huffmanCountMask)
 		if n > huffmanChunkBits {
-			chunk = h.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&h.linkMask]
+			chunk = h.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&h.linkMask]
 			n = uint(chunk & huffmanCountMask)
 		}
 		if n <= nb {
@@ -781,7 +931,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 				f.err = CorruptInputError(f.roffset + int64(f.nfed))
 				return 0, f.err
 			}
-			f.b = b >> (n & 31)
+			f.b = b >> (n & 63)
 			f.nb = nb - n
 			return int(chunk >> huffmanValueShift), nil
 		}
