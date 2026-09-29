@@ -507,6 +507,16 @@ var distExtraBits = [maxNumDist]uint8{
 // and the distance values, respectively. If hd == nil, using the
 // fixed distance encoding associated with fixed Huffman blocks.
 func (f *decompressor) huffmanBlock() {
+	if f.pr != nil {
+		f.huffmanBlockPeek()
+	} else {
+		f.huffmanBlockByte()
+	}
+}
+
+// huffmanBlockPeek decodes a Huffman block using a 64-bit bit buffer refilled
+// 8 bytes at a time from peekable readers (f.pr != nil).
+func (f *decompressor) huffmanBlockPeek() {
 	const (
 		stateInit = iota // Zero value must be stateInit
 		stateDict
@@ -674,7 +684,7 @@ readLiteral:
 			return
 		case exitFlush:
 			f.toRead = f.dict.readFlush()
-			f.step = (*decompressor).huffmanBlock
+			f.step = (*decompressor).huffmanBlockPeek
 			f.stepState = stateInit
 			return
 		case exitCopy:
@@ -683,9 +693,10 @@ readLiteral:
 		}
 	}
 
-	// Slow path: decode a single symbol, reading input one byte at a time
-	// and only as needed. This is used when the input does not support
-	// peeking, and when the peek window is nearly exhausted.
+	// Peek-exhaustion fallback: decode a single symbol when the peek window
+	// has fewer than 8 bytes remaining (near EOF or a chunk boundary). Calling
+	// huffSym may trigger peekMore() to fetch the next chunk, allowing the
+	// 64-bit fast path to resume at readLiteral.
 	{
 		v, err := f.huffSym(f.hl)
 		if err != nil {
@@ -696,7 +707,7 @@ readLiteral:
 			f.dict.writeByte(byte(v))
 			if f.dict.availWrite() == 0 {
 				f.toRead = f.dict.readFlush()
-				f.step = (*decompressor).huffmanBlock
+				f.step = (*decompressor).huffmanBlockPeek
 				f.stepState = stateInit
 				return
 			}
@@ -758,7 +769,213 @@ copyHistory:
 
 		if f.dict.availWrite() == 0 || f.copyLen > 0 {
 			f.toRead = f.dict.readFlush()
-			f.step = (*decompressor).huffmanBlock // We need to continue this work
+			f.step = (*decompressor).huffmanBlockPeek // We need to continue this work
+			f.stepState = stateDict
+			return
+		}
+		goto readLiteral
+	}
+}
+
+// huffmanBlockByte decodes a Huffman block from an unpeekable reader (f.pr == nil).
+func (f *decompressor) huffmanBlockByte() {
+	const (
+		stateInit = iota // Zero value must be stateInit
+		stateDict
+	)
+
+	switch f.stepState {
+	case stateInit:
+		goto readLiteral
+	case stateDict:
+		goto copyHistory
+	}
+
+readLiteral:
+	// Read literals and/or (length, distance) pairs according to RFC section 3.2.3.
+	//
+	// In standard builds, huffSym cannot be inlined by the compiler because its
+	// complexity score (cost 218) exceeds the default inlining budget (80).
+	//
+	// Because literal symbols dominate DEFLATE streams, calling huffSym as a
+	// separate function on every symbol incurs function call overhead and
+	// forces the compiler to repeatedly reload the bit buffer (f.b, f.nb)
+	// from struct memory.
+	//
+	// Inlining the literal decoding path and hoisting the bit buffer state into
+	// local variables (b, nb) keeps the bit buffer in hardware registers
+	// across consecutive literals, only synchronizing back to f.b and f.nb when
+	// yielding or decoding distance symbols (see https://go.dev/cl/227737 for
+	// prior art on decompression loop inlining).
+	{
+		b, nb := f.b, f.nb
+		hl, hd := f.hl, f.hd
+		hlMin := uint(hl.min)
+		r := f.r
+
+		for {
+			// Decode the literal/length symbol.
+			n := hlMin
+			var v int
+			for {
+				for nb < n {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint64(c) << (nb & 63)
+					nb += 8
+				}
+				chunk := hl.chunks[b&(huffmanNumChunks-1)]
+				n = uint(chunk & huffmanCountMask)
+				if n > huffmanChunkBits {
+					chunk = hl.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hl.linkMask]
+					n = uint(chunk & huffmanCountMask)
+				}
+				if n <= nb {
+					if n == 0 {
+						f.b, f.nb = b, nb
+						f.err = CorruptInputError(f.roffset)
+						return
+					}
+					b >>= (n & 63)
+					nb -= n
+					v = int(chunk >> huffmanValueShift)
+					break
+				}
+			}
+
+			if v < 256 {
+				f.dict.writeByte(byte(v))
+				if f.dict.availWrite() == 0 {
+					f.b, f.nb = b, nb
+					f.toRead = f.dict.readFlush()
+					f.step = (*decompressor).huffmanBlockByte
+					f.stepState = stateInit
+					return
+				}
+				continue
+			}
+
+			if v == 256 {
+				f.b, f.nb = b, nb
+				f.finishBlock()
+				return
+			}
+
+			if v > maxLengthCode {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			// Reference to older data.
+			v -= lengthCodesStart
+			extraBits := uint(lengthExtraBits[v])
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint64(c) << (nb & 63)
+				nb += 8
+			}
+			length := int(lengthBase[v]) + 3 + int(b&(1<<extraBits-1))
+			b >>= extraBits & 63
+			nb -= extraBits
+
+			// Decode the distance symbol.
+			var dist int
+			if hd == nil {
+				for nb < 5 {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint64(c) << (nb & 63)
+					nb += 8
+				}
+				dist = int(bits.Reverse8(uint8(b&0x1F) << 3))
+				b >>= 5
+				nb -= 5
+			} else {
+				f.b, f.nb = b, nb
+				var err error
+				if dist, err = f.huffSym(hd); err != nil {
+					f.err = err
+					return
+				}
+				b, nb = f.b, f.nb
+			}
+
+			if dist >= maxNumDist {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+			// Decode distance extra bits.
+			extraBits = uint(distExtraBits[dist])
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint64(c) << (nb & 63)
+				nb += 8
+			}
+			dist = int(distBase[dist]) + int(b&(1<<extraBits-1))
+			b >>= extraBits & 63
+			nb -= extraBits
+
+			// No check on length; encoding can be prescient.
+			if dist > f.dict.histSize() {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			// Common case: try to copy in-window without wrapping.
+			cnt := f.dict.tryWriteCopy(dist, length)
+			if cnt == 0 {
+				cnt = f.dict.writeCopy(dist, length)
+			}
+			length -= cnt
+
+			if f.dict.availWrite() == 0 || length > 0 {
+				f.b, f.nb = b, nb
+				f.copyLen, f.copyDist = length, dist
+				f.toRead = f.dict.readFlush()
+				f.step = (*decompressor).huffmanBlockByte
+				f.stepState = stateDict
+				return
+			}
+		}
+	}
+
+copyHistory:
+	// Perform a backwards copy according to RFC section 3.2.3.
+	{
+		cnt := f.dict.tryWriteCopy(f.copyDist, f.copyLen)
+		if cnt == 0 {
+			cnt = f.dict.writeCopy(f.copyDist, f.copyLen)
+		}
+		f.copyLen -= cnt
+
+		if f.dict.availWrite() == 0 || f.copyLen > 0 {
+			f.toRead = f.dict.readFlush()
+			f.step = (*decompressor).huffmanBlockByte
 			f.stepState = stateDict
 			return
 		}

@@ -59,6 +59,36 @@ func BenchmarkDecode(b *testing.B) {
 	})
 }
 
+func BenchmarkDecodeUnpeekable(b *testing.B) {
+	doBench(b, func(b *testing.B, buf0 []byte, level, n int) {
+		b.ReportAllocs()
+		b.StopTimer()
+		b.SetBytes(int64(n))
+
+		compressed := new(bytes.Buffer)
+		w, err := NewWriter(compressed, level)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for i := 0; i < n; i += len(buf0) {
+			if len(buf0) > n-i {
+				buf0 = buf0[:n-i]
+			}
+			io.Copy(w, bytes.NewReader(buf0))
+		}
+		w.Close()
+		buf1 := compressed.Bytes()
+		buf0, compressed, w = nil, nil, nil
+		runtime.GC()
+		b.StartTimer()
+		for i := 0; i < b.N; i++ {
+			r := bytes.NewReader(buf1)
+			io.Copy(io.Discard, NewReader(byteReaderOnly{r, r}))
+		}
+	})
+}
+
+
 var levelTests = []struct {
 	name  string
 	level int
