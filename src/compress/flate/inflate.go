@@ -514,12 +514,159 @@ func (f *decompressor) huffmanBlock() {
 
 	switch f.stepState {
 	case stateInit:
-		goto readLiteral
+		if f.pr == nil {
+			goto readLiteralByte
+		}
+		goto readLiteralPeek
 	case stateDict:
 		goto copyHistory
 	}
 
-readLiteral:
+readLiteralByte:
+	// Inlined literal/length decoding loop for unpeekable readers (f.pr == nil).
+	// Hoisting the bit buffer state (b, nb) into registers and inlining literal
+	// decoding avoids bouncing into huffSym on every single symbol.
+	{
+		b, nb := f.b, f.nb
+		hl, hd := f.hl, f.hd
+		hlMin := uint(hl.min)
+		r := f.r
+
+		for {
+			n := hlMin
+			var v int
+			for {
+				for nb < n {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint64(c) << (nb & 63)
+					nb += 8
+				}
+				chunk := hl.chunks[b&(huffmanNumChunks-1)]
+				n = uint(chunk & huffmanCountMask)
+				if n > huffmanChunkBits {
+					chunk = hl.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hl.linkMask]
+					n = uint(chunk & huffmanCountMask)
+				}
+				if n <= nb {
+					if n == 0 {
+						f.b, f.nb = b, nb
+						f.err = CorruptInputError(f.roffset)
+						return
+					}
+					b >>= (n & 63)
+					nb -= n
+					v = int(chunk >> huffmanValueShift)
+					break
+				}
+			}
+
+			if v < 256 {
+				f.dict.writeByte(byte(v))
+				if f.dict.availWrite() == 0 {
+					f.b, f.nb = b, nb
+					f.toRead = f.dict.readFlush()
+					f.step = (*decompressor).huffmanBlock
+					f.stepState = stateInit
+					return
+				}
+				continue
+			}
+
+			if v == 256 {
+				f.b, f.nb = b, nb
+				f.finishBlock()
+				return
+			}
+
+			if v > maxLengthCode {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			v -= lengthCodesStart
+			extraBits := uint(lengthExtraBits[v])
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint64(c) << (nb & 63)
+				nb += 8
+			}
+			length := int(lengthBase[v]) + 3 + int(b&(1<<extraBits-1))
+			b >>= extraBits & 63
+			nb -= extraBits
+
+			var dist int
+			if hd == nil {
+				for nb < 5 {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint64(c) << (nb & 63)
+					nb += 8
+				}
+				dist = int(bits.Reverse8(uint8(b&0x1F) << 3))
+				b >>= 5
+				nb -= 5
+			} else {
+				f.b, f.nb = b, nb
+				var err error
+				if dist, err = f.huffSym(hd); err != nil {
+					f.err = err
+					return
+				}
+				b, nb = f.b, f.nb
+			}
+
+			if dist >= maxNumDist {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+			extraBits = uint(distExtraBits[dist])
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint64(c) << (nb & 63)
+				nb += 8
+			}
+			dist = int(distBase[dist]) + int(b&(1<<extraBits-1))
+			b >>= extraBits & 63
+			nb -= extraBits
+
+			if dist > f.dict.histSize() {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			f.b, f.nb = b, nb
+			f.copyLen, f.copyDist = length, dist
+			goto copyHistory
+		}
+	}
+
+readLiteralPeek:
 	// Read literals and/or (length, distance) pairs according to
 	// RFC section 3.2.3.
 	//
@@ -683,9 +830,10 @@ readLiteral:
 		}
 	}
 
-	// Slow path: decode a single symbol, reading input one byte at a time
-	// and only as needed. This is used when the input does not support
-	// peeking, and when the peek window is nearly exhausted.
+	// Peek-exhaustion fallback: decode a single symbol when the peek window
+	// has fewer than 8 bytes remaining (near EOF or a chunk boundary). Calling
+	// huffSym may trigger peekMore() to fetch the next chunk, allowing the
+	// 64-bit fast path to resume at readLiteralPeek.
 	{
 		v, err := f.huffSym(f.hl)
 		if err != nil {
@@ -700,7 +848,10 @@ readLiteral:
 				f.stepState = stateInit
 				return
 			}
-			goto readLiteral
+			if f.pr == nil {
+				goto readLiteralByte
+			}
+			goto readLiteralPeek
 		}
 		if v == 256 {
 			f.finishBlock()
@@ -762,7 +913,10 @@ copyHistory:
 			f.stepState = stateDict
 			return
 		}
-		goto readLiteral
+		if f.pr == nil {
+			goto readLiteralByte
+		}
+		goto readLiteralPeek
 	}
 }
 
