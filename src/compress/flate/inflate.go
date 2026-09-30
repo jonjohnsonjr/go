@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"io"
 	"math/bits"
+	"simd/archsimd"
 	"strconv"
 	"sync"
 )
@@ -644,21 +645,39 @@ readLiteral:
 				exit = exitCopy
 				break
 			}
-			if wrPos+length > len(hist) {
+			if wrPos+length+16 > len(hist) {
 				exit = exitCopy
 				break
 			}
-			// Common case: the copy fits in the window without wrapping,
-			// so it can be done in place. Source and destination overlap
-			// if length is larger than dist, so copy in non-overlapping
-			// chunks.
-			srcPos, endPos := wrPos-dist, wrPos+length
-			for wrPos < endPos {
-				wrPos += copy(hist[wrPos:endPos], hist[srcPos:wrPos])
-			}
-			if wrPos == len(hist) {
-				exit = exitFlush
-				break
+			// Common case: the copy fits in the window with at least 16 bytes
+			// of headroom, so it can be done in place with 16-byte vectors.
+			{
+				dstPos := wrPos
+				endPos := dstPos + length
+				srcPos := dstPos - dist
+				v := archsimd.LoadUint8x16(hist[srcPos:]).PermuteOrZero(distMaskTables[min(dist, 16)])
+				if length > 16 {
+					if dist >= 16 {
+						for {
+							v.Store(hist[dstPos:])
+							dstPos += 16
+							srcPos += 16
+							v = archsimd.LoadUint8x16(hist[srcPos:])
+							if endPos-dstPos <= 16 {
+								break
+							}
+						}
+					} else {
+						step := int(distStep[dist])
+						for endPos-dstPos > 16 {
+							v.Store(hist[dstPos:])
+							dstPos += step
+						}
+					}
+				}
+				orig := archsimd.LoadUint8x16(hist[dstPos:])
+				v.IfElse(lenMaskTables[endPos-dstPos], orig).Store(hist[dstPos:])
+				wrPos = endPos
 			}
 		}
 
