@@ -554,17 +554,35 @@ readLiteral:
 		)
 		exit := exitSlow
 
+		// Keep live loop variables within x86-64's 13 usable GPRs so hl, pb,
+		// nb, and chunk do not spill to the stack on the literal loopback:
+		//   - Omit f.nfed and f.dict.full from loop locals (only read on exit).
+		//   - Convert f.dict.hist ([]byte, 3 registers: ptr/len/cap) to a
+		//     *[maxMatchOffset]byte array pointer (1 register, constant len/cap).
 		hl, hd := f.hl, f.hd
 		b, nb := f.b, f.nb
 		pb, pi := f.pb, 0
 		hist, wrPos := (*[maxMatchOffset]byte)(f.dict.hist), f.dict.wrPos
 		var length, dist int
+
+		// Prime all 64 bits of b before entering the loop so Iteration 1 can
+		// also index hl.chunks before refilling. (Leaving pi and nb unchanged
+		// makes the first in-loop refill idempotent, and loop exit masks b to
+		// nb bits via b &= 1<<(nb&63) - 1.)
 		if len(pb)-pi >= 8 {
 			b |= loadLE64(pb, pi) << (nb & 63)
 		}
 		for len(pb)-pi >= 8 {
-			// Decode the literal/length symbol using the already-valid low bits
-			// of b while refilling the upper bits of b in parallel.
+			// Each refill below populates all 64 bits of b with valid input
+			// bits (nb only tracks the 56..63 bits in the 7 whole bytes
+			// advanced by pi; the remaining 1..8 top bits are already the next
+			// input bits in their proper positions). Because one iteration
+			// consumes at most 15+5+15+13 = 48 bits, b always retains at least
+			// 64-48 = 16 valid bits at the start of the next iteration.
+			//
+			// Indexing hl.chunks[b&511] BEFORE b |= loadLE64(...) breaks the
+			// register dependency on b, allowing the CPU to issue the hl.chunks
+			// L1 load and the loadLE64 refill + shift + OR in parallel.
 			chunk := hl.chunks[b&(huffmanNumChunks-1)]
 			b |= loadLE64(pb, pi) << (nb & 63)
 			pi += 7 - int(nb>>3)
@@ -583,6 +601,8 @@ readLiteral:
 			nb -= n
 			v := int(chunk >> huffmanValueShift)
 			if v < 256 {
+				// Masking wrPos with maxMatchOffset-1 on *[maxMatchOffset]byte
+				// proves the index is in bounds (< 32768) with zero branches.
 				hist[wrPos&(maxMatchOffset-1)] = byte(v)
 				wrPos++
 				if wrPos == maxMatchOffset {
@@ -601,6 +621,11 @@ readLiteral:
 			}
 			v -= lengthCodesStart
 			n = uint(lengthExtraBits[v])
+			// Advance b before computing length so the distance table lookup
+			// (hd.chunks[b&511]) can start without waiting on lengthBase[v].
+			// Masking 1<<(n&63) tells the compiler n < 64, suppressing Go's
+			// 3-instruction shift-overflow guard (CMPQ $64; SBBQ; ANDQ) and
+			// avoiding a CX clobber/spill.
 			b0 := b
 			b >>= n & 63
 			nb -= n
@@ -631,6 +656,7 @@ readLiteral:
 				break
 			}
 			n = uint(distExtraBits[dist])
+			// Use 1<<(n&63) to suppress Go's shift-overflow guard.
 			dist = int(distBase[dist]) + int(b&(1<<(n&63)-1))
 			b >>= n & 63
 			nb -= n
