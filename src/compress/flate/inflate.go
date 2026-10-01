@@ -556,20 +556,20 @@ readLiteral:
 
 		hl, hd := f.hl, f.hd
 		b, nb := f.b, f.nb
-		pb, pi, nfed := f.pb, 0, f.nfed
-		hist, wrPos, full := f.dict.hist, f.dict.wrPos, f.dict.full
+		pb, pi := f.pb, 0
+		hist, wrPos := (*[maxMatchOffset]byte)(f.dict.hist), f.dict.wrPos
 		var length, dist int
+		if len(pb)-pi >= 8 {
+			b |= loadLE64(pb, pi) << (nb & 63)
+		}
 		for len(pb)-pi >= 8 {
-			// Refill the bit buffer to 56-63 bits. The load may bring in
-			// bits beyond those accounted for by nb; they are the bits of
-			// the following input bytes, in their proper positions, so they
-			// are simply loaded again by a later refill.
+			// Decode the literal/length symbol using the already-valid low bits
+			// of b while refilling the upper bits of b in parallel.
+			chunk := hl.chunks[b&(huffmanNumChunks-1)]
 			b |= loadLE64(pb, pi) << (nb & 63)
 			pi += 7 - int(nb>>3)
 			nb |= 56
 
-			// Decode the literal/length symbol.
-			chunk := hl.chunks[b&(huffmanNumChunks-1)]
 			n := uint(chunk & huffmanCountMask)
 			if n > huffmanChunkBits {
 				chunk = hl.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hl.linkMask]
@@ -583,9 +583,9 @@ readLiteral:
 			nb -= n
 			v := int(chunk >> huffmanValueShift)
 			if v < 256 {
-				hist[wrPos] = byte(v)
+				hist[wrPos&(maxMatchOffset-1)] = byte(v)
 				wrPos++
-				if wrPos == len(hist) {
+				if wrPos == maxMatchOffset {
 					exit = exitFlush
 					break
 				}
@@ -601,9 +601,10 @@ readLiteral:
 			}
 			v -= lengthCodesStart
 			n = uint(lengthExtraBits[v])
-			length = int(lengthBase[v]) + 3 + int(b&(1<<n-1))
+			b0 := b
 			b >>= n & 63
 			nb -= n
+			length = int(lengthBase[v]) + 3 + int(b0&(1<<(n&63)-1))
 
 			// Decode the distance symbol.
 			if hd == nil {
@@ -630,14 +631,14 @@ readLiteral:
 				break
 			}
 			n = uint(distExtraBits[dist])
-			dist = int(distBase[dist]) + int(b&(1<<n-1))
+			dist = int(distBase[dist]) + int(b&(1<<(n&63)-1))
 			b >>= n & 63
 			nb -= n
 
 			// Perform a backwards copy according to RFC section 3.2.3.
 			// No check on length; encoding can be prescient.
 			if dist > wrPos {
-				if !full {
+				if !f.dict.full {
 					exit = exitCorrupt
 					break
 				}
@@ -645,7 +646,7 @@ readLiteral:
 				exit = exitCopy
 				break
 			}
-			if wrPos+length+16 > len(hist) {
+			if wrPos+length+16 > maxMatchOffset {
 				exit = exitCopy
 				break
 			}
@@ -688,15 +689,14 @@ readLiteral:
 		k := min(int(nb>>3), pi)
 		pi -= k
 		nb -= 8 * uint(k)
-		b &= 1<<nb - 1
-		nfed += pi
+		b &= 1<<(nb&63) - 1
 		f.b, f.nb = b, nb
-		f.pb, f.nfed = pb[pi:], nfed
+		f.pb, f.nfed = pb[pi:], f.nfed+pi
 		f.dict.wrPos = wrPos
 
 		switch exit {
 		case exitCorrupt:
-			f.err = CorruptInputError(f.roffset + int64(nfed))
+			f.err = CorruptInputError(f.roffset + int64(f.nfed))
 			return
 		case exitEndBlock:
 			f.finishBlock()
