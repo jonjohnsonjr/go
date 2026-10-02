@@ -668,11 +668,19 @@ readLiteral:
 					exit = exitCorrupt
 					break
 				}
-				// The source wraps around the window.
-				exit = exitCopy
-				break
-			}
-			if wrPos+length+16 > maxMatchOffset {
+				// The source wraps around to the upper part of the 32 KB circular
+				// window: srcPos = maxMatchOffset + wrPos - dist. As long as the
+				// source does not cross the end of hist (srcPos+length+16 <= maxMatchOffset,
+				// i.e. wrPos+length+16 <= dist) and the destination does not overwrite
+				// the source (wrPos+length+16 <= srcPos, i.e. dist+length+16 <= maxMatchOffset),
+				// both slices are contiguous and disjoint (with dist >= 19 > 16),
+				// so the 16-byte SIMD copy below can handle it in place without
+				// bailing out of the fast loop.
+				if wrPos+length+16 > dist || dist+length+16 > maxMatchOffset {
+					exit = exitCopy
+					break
+				}
+			} else if wrPos+length+16 > maxMatchOffset {
 				exit = exitCopy
 				break
 			}
@@ -681,7 +689,7 @@ readLiteral:
 			{
 				dstPos := wrPos
 				endPos := dstPos + length
-				srcPos := dstPos - dist
+				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
 				v := archsimd.LoadUint8x16(hist[srcPos:]).PermuteOrZero(distMaskTables[min(dist, 16)])
 				if length > 16 {
 					if dist >= 16 {
