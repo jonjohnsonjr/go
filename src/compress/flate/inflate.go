@@ -119,7 +119,7 @@ type huffmanDecoder struct {
 // tree (i.e., neither over-subscribed nor under-subscribed). The exception is a
 // degenerate case where the tree has only a single symbol with length 1. Empty
 // trees are permitted.
-func (h *huffmanDecoder) init(lengths []int) bool {
+func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 	// Sanity enables additional runtime tests during Huffman
 	// table construction. It's intended to be used during
 	// development to supplement the currently ad-hoc unit tests.
@@ -127,6 +127,11 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 
 	if h.min != 0 {
 		*h = huffmanDecoder{}
+	}
+
+	var tmpl []uint32
+	if len(symTemplate) > 0 {
+		tmpl = symTemplate[0]
 	}
 
 	// Count number of codes of each length,
@@ -201,6 +206,9 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 		code := nextcode[n]
 		nextcode[n]++
 		chunk := uint32(i<<huffmanValueShift | n)
+		if i < len(tmpl) {
+			chunk = tmpl[i] | uint32(n)
+		}
 		reverse := int(bits.Reverse16(uint16(code)))
 		reverse >>= uint(16 - n)
 		if n <= huffmanChunkBits {
@@ -474,7 +482,7 @@ func (f *decompressor) readHuffman() error {
 		}
 	}
 
-	if !f.h1.init(f.bits[0:nlit]) || !f.h2.init(f.bits[nlit:nlit+ndist]) {
+	if !f.h1.init(f.bits[0:nlit], litChunkTemplate[:]) || !f.h2.init(f.bits[nlit:nlit+ndist], distChunkTemplate[:]) {
 		return CorruptInputError(f.roffset + int64(f.nfed))
 	}
 
@@ -501,6 +509,58 @@ var distExtraBits = [maxNumDist]uint8{
 	0, 0, 0, 0, 1, 1, 2, 2, 3, 3,
 	4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
 	9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+}
+
+// Precomputed symbol chunk templates for literal/length (hl) and distance (hd)
+// Huffman tables. Every non-link uint32 chunk packs four fields:
+//
+//	bits 0..3:   Huffman code length n (1..15, or 0 if unassigned)
+//	bits 4..12:  symbol index i (0..287)
+//	bits 13..16: extra bits count (0..5 for lengths, 0..13 for distances)
+//	bits 17..31: base value (lengthBase+3 for lengths 257..285, distBase for distances 0..29)
+//
+// Because extra and base are 0 for literals (0..255), EOB (256), and link entries,
+// chunk >> 4 is unchanged for those cases, while huffmanBlockPeek can extract
+// length/dist base (chunk >> 17) and extra bits ((chunk >> 13) & 15) directly
+// from the chunk register without secondary array loads.
+var (
+	litChunkTemplate  [maxNumLit + 2]uint32
+	distChunkTemplate [32]uint32
+	fixedDistChunks   [32]uint32
+)
+
+func init() {
+	for i := 0; i < len(litChunkTemplate); i++ {
+		if i < 256 {
+			litChunkTemplate[i] = uint32(i << huffmanValueShift)
+		} else if i == 256 {
+			litChunkTemplate[i] = uint32(256 << huffmanValueShift)
+		} else if i <= 285 {
+			v := i - lengthCodesStart
+			extra := uint32(lengthExtraBits[v])
+			base := uint32(lengthBase[v]) + 3
+			litChunkTemplate[i] = uint32(i<<huffmanValueShift) | (extra << 13) | (base << 17)
+		} else {
+			litChunkTemplate[i] = uint32(i << huffmanValueShift)
+		}
+	}
+	for i := 0; i < len(distChunkTemplate); i++ {
+		if i < maxNumDist {
+			extra := uint32(distExtraBits[i])
+			base := uint32(distBase[i])
+			distChunkTemplate[i] = uint32(i<<huffmanValueShift) | (extra << 13) | (base << 17)
+		} else {
+			distChunkTemplate[i] = uint32(i << huffmanValueShift)
+		}
+	}
+	for raw := 0; raw < 32; raw++ {
+		sym := int(bits.Reverse8(uint8(raw) << 3))
+		if sym < maxNumDist {
+			extra := uint32(distExtraBits[sym])
+			base := uint32(distBase[sym])
+			fixedDistChunks[raw] = uint32(sym<<huffmanValueShift) | (extra << 13) | (base << 17)
+		}
+	}
 }
 
 // Decode a single Huffman block from f.
@@ -615,25 +675,31 @@ readLiteral:
 				exit = exitEndBlock
 				break
 			}
-			if v > maxLengthCode {
+			// Extract pre-packed lengthBase+3 (bits 17..31) and lengthExtraBits
+			// (bits 13..16) directly from chunk, avoiding secondary array loads
+			// and keeping v's live range confined to the literal/EOB checks above.
+			// Invalid length codes (286, 287) have base == 0.
+			length = int(chunk >> 17)
+			if length == 0 {
 				exit = exitCorrupt
 				break
 			}
-			v -= lengthCodesStart
-			n = uint(lengthExtraBits[v])
+			n = uint(chunk>>13) & 15
 			// Advance b before computing length so the distance table lookup
-			// (hd.chunks[b&511]) can start without waiting on lengthBase[v].
+			// (hd.chunks[b&511]) can start without waiting on length.
 			// Masking 1<<(n&63) tells the compiler n < 64, suppressing Go's
 			// 3-instruction shift-overflow guard (CMPQ $64; SBBQ; ANDQ) and
 			// avoiding a CX clobber/spill.
 			b0 := b
 			b >>= n & 63
 			nb -= n
-			length = int(lengthBase[v]) + 3 + int(b0&(1<<(n&63)-1))
+			length += int(b0 & (1<<(n&63) - 1))
 
-			// Decode the distance symbol.
+			// Decode the distance symbol. Both fixedDistChunks and hd pack
+			// distBase (bits 17..31, >= 1 for valid symbols 0..29 and 0 for
+			// unassigned/invalid symbols 30..31) and distExtraBits (bits 13..16).
 			if hd == nil {
-				dist = int(bits.Reverse8(uint8(b&0x1F) << 3))
+				chunk = fixedDistChunks[b&0x1F]
 				b >>= 5
 				nb -= 5
 			} else {
@@ -643,21 +709,17 @@ readLiteral:
 					chunk = hd.links[chunk>>huffmanValueShift][uint32(b>>huffmanChunkBits)&hd.linkMask]
 					n = uint(chunk & huffmanCountMask)
 				}
-				if n == 0 {
-					exit = exitCorrupt
-					break
-				}
 				b >>= n & 63
 				nb -= n
-				dist = int(chunk >> huffmanValueShift)
 			}
-			if dist >= maxNumDist {
+			dist = int(chunk >> 17)
+			if dist == 0 {
 				exit = exitCorrupt
 				break
 			}
-			n = uint(distExtraBits[dist])
+			n = uint(chunk>>13) & 15
 			// Use 1<<(n&63) to suppress Go's shift-overflow guard.
-			dist = int(distBase[dist]) + int(b&(1<<(n&63)-1))
+			dist += int(b & (1<<(n&63) - 1))
 			b >>= n & 63
 			nb -= n
 
@@ -896,7 +958,7 @@ readLiteral:
 					}
 					b >>= (n & 63)
 					nb -= n
-					v = int(chunk >> huffmanValueShift)
+					v = int(chunk>>huffmanValueShift) & 0x1ff
 					break
 				}
 			}
@@ -1203,7 +1265,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 			}
 			f.b = b >> (n & 63)
 			f.nb = nb - n
-			return int(chunk >> huffmanValueShift), nil
+			return int(chunk>>huffmanValueShift) & 0x1ff, nil
 		}
 	}
 }
@@ -1242,7 +1304,7 @@ func fixedHuffmanDecoderInit() {
 		for i := 280; i < 288; i++ {
 			bits[i] = 8
 		}
-		fixedHuffmanDecoder.init(bits[:])
+		fixedHuffmanDecoder.init(bits[:], litChunkTemplate[:])
 	})
 }
 
