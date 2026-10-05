@@ -637,7 +637,6 @@ readLiteral:
 		b, nb := f.b, f.nb
 		pb, pi := f.pb, 0
 		hist, wrPos := (*[maxMatchOffset]byte)(f.dict.hist), f.dict.wrPos
-		var length, dist int
 
 		// Prime all 64 bits of b before entering the loop so Iteration 1 can
 		// also index hl.chunks before refilling. (Leaving pi and nb unchanged
@@ -693,7 +692,7 @@ readLiteral:
 			// (bits 13..16) directly from chunk, avoiding secondary array loads
 			// and keeping v's live range confined to the literal/EOB checks above.
 			// Invalid length codes (286, 287) have base == 0.
-			length = int(chunk >> 17)
+			length := int(chunk >> 17)
 			if length == 0 {
 				exit = exitCorrupt
 				break
@@ -726,7 +725,7 @@ readLiteral:
 				b >>= n & 63
 				nb -= n
 			}
-			dist = int(chunk >> 17)
+			dist := int(chunk >> 17)
 			if dist == 0 {
 				exit = exitCorrupt
 				break
@@ -753,10 +752,12 @@ readLiteral:
 				// so the 16-byte SIMD copy below can handle it in place without
 				// bailing out of the fast loop.
 				if wrPos+length+16 > dist || dist+length+16 > maxMatchOffset {
+					f.copyLen, f.copyDist = length, dist
 					exit = exitCopy
 					break
 				}
 			} else if wrPos+length+16 > maxMatchOffset {
+				f.copyLen, f.copyDist = length, dist
 				exit = exitCopy
 				break
 			}
@@ -801,7 +802,7 @@ readLiteral:
 		nb -= 8 * uint(k)
 		b &= 1<<(nb&63) - 1
 		f.b, f.nb = b, nb
-		f.pb, f.nfed = pb[pi:], f.nfed+pi
+		f.pb, f.nfed = f.pb[pi:], f.nfed+pi
 		f.dict.wrPos = wrPos
 
 		switch exit {
@@ -817,7 +818,6 @@ readLiteral:
 			f.stepState = stateInit
 			return
 		case exitCopy:
-			f.copyLen, f.copyDist = length, dist
 			goto copyHistory
 		}
 	}

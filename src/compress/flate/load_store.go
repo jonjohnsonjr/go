@@ -4,6 +4,8 @@
 
 package flate
 
+import "unsafe"
+
 // This file contains functions for loading and storing integers in little endian format.
 // These can be replaced with unsafe versions if deemed necessary.
 
@@ -24,9 +26,7 @@ func loadLE32[I indexer](b []byte, i I) uint32 {
 
 // loadLE64 will load from b at index i.
 func loadLE64[I indexer](b []byte, i I) uint64 {
-	b = b[i : i+8]
-	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
-		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
+	return *(*uint64)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(b)), i))
 }
 
 // storeLE64 will store v at start of b.
