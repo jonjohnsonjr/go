@@ -13,18 +13,18 @@ import "simd/archsimd"
 // allowing the same PermuteOrZero vector to be stored repeatedly without reloading.
 var distStep = [16]uint8{0, 16, 16, 15, 16, 15, 12, 14, 16, 9, 10, 11, 12, 13, 14, 15}
 
-var distMaskTables = func() (masks [17]archsimd.Int8x16) {
-	for d := 1; d <= 16; d++ {
+var distMaskTables = func() (masks [16]archsimd.Int8x16) {
+	for d := 1; d < 16; d++ {
 		var arr [16]int8
 		for i := range arr {
-			arr[i] = int8(i % d) // for d == 16, i % 16 == i (identity)
+			arr[i] = int8(i % d)
 		}
 		masks[d] = archsimd.LoadInt8x16Array(&arr)
 	}
 	return masks
 }()
 
-var lenMaskTables = func() (masks [17]archsimd.Mask8x16) {
+var lenMaskTables = func() (masks [32]archsimd.Mask8x16) {
 	for k := 0; k <= 16; k++ {
 		var arr [16]int8
 		for i := range k {

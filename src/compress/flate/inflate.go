@@ -767,7 +767,10 @@ readLiteral:
 				dstPos := wrPos
 				endPos := dstPos + length
 				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
-				v := load16(hist, srcPos).PermuteOrZero(distMaskTables[min(dist, 16)])
+				v := load16(hist, srcPos)
+				if dist < 16 {
+					v = v.PermuteOrZero(distMaskTables[dist&15])
+				}
 				if length > 16 {
 					if dist >= 16 {
 						for {
@@ -788,7 +791,7 @@ readLiteral:
 					}
 				}
 				orig := load16(hist, dstPos)
-				store16(hist, dstPos, v.IfElse(lenMaskTables[endPos-dstPos], orig))
+				store16(hist, dstPos, v.IfElse(lenMaskTables[(endPos-dstPos)&31], orig))
 				wrPos = endPos
 			}
 		}
