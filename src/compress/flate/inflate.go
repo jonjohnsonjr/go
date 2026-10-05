@@ -14,6 +14,7 @@ import (
 	"simd/archsimd"
 	"strconv"
 	"sync"
+	"unsafe"
 )
 
 const (
@@ -575,6 +576,19 @@ func (f *decompressor) huffmanBlock() {
 	}
 }
 
+// The preceding wrPos+length+16 / dist bounds checks guarantee
+// 0 <= i <= maxMatchOffset-16, and using LoadUint8x16Array/StoreArray via
+// unsafe.Add avoids the 40+ instructions of slice creation, Spectre slice-base
+// masking, and (*[16]byte)(slice) length checks without bumping dd.hist out
+// of Go's 32 KB malloc size class.
+func load16(p *[maxMatchOffset]byte, i int) archsimd.Uint8x16 {
+	return archsimd.LoadUint8x16Array((*[16]byte)(unsafe.Add(unsafe.Pointer(p), i)))
+}
+
+func store16(p *[maxMatchOffset]byte, i int, v archsimd.Uint8x16) {
+	v.StoreArray((*[16]byte)(unsafe.Add(unsafe.Pointer(p), i)))
+}
+
 // huffmanBlockPeek decodes a Huffman block using a 64-bit bit buffer refilled
 // 8 bytes at a time from peekable readers (f.pr != nil).
 func (f *decompressor) huffmanBlockPeek() {
@@ -752,14 +766,14 @@ readLiteral:
 				dstPos := wrPos
 				endPos := dstPos + length
 				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
-				v := archsimd.LoadUint8x16(hist[srcPos:]).PermuteOrZero(distMaskTables[min(dist, 16)])
+				v := load16(hist, srcPos).PermuteOrZero(distMaskTables[min(dist, 16)])
 				if length > 16 {
 					if dist >= 16 {
 						for {
-							v.Store(hist[dstPos:])
+							store16(hist, dstPos, v)
 							dstPos += 16
 							srcPos += 16
-							v = archsimd.LoadUint8x16(hist[srcPos:])
+							v = load16(hist, srcPos)
 							if endPos-dstPos <= 16 {
 								break
 							}
@@ -767,13 +781,13 @@ readLiteral:
 					} else {
 						step := int(distStep[dist])
 						for endPos-dstPos > 16 {
-							v.Store(hist[dstPos:])
+							store16(hist, dstPos, v)
 							dstPos += step
 						}
 					}
 				}
-				orig := archsimd.LoadUint8x16(hist[dstPos:])
-				v.IfElse(lenMaskTables[endPos-dstPos], orig).Store(hist[dstPos:])
+				orig := load16(hist, dstPos)
+				store16(hist, dstPos, v.IfElse(lenMaskTables[endPos-dstPos], orig))
 				wrPos = endPos
 			}
 		}
