@@ -681,17 +681,15 @@ readLiteral:
 				chunk = hl.links[(chunk>>huffmanValueShift)|(uint32(b>>huffmanChunkBits)&hl.linkMask)]
 				n = uint(chunk & huffmanCountMask)
 			}
-			if n == 0 {
-				exit = exitCorrupt
-				break
-			}
 			b >>= n & 63
 			nb -= n
-			v := int(chunk >> huffmanValueShift)
-			if v < 256 {
+			// Valid literals (0..255) have 1 <= n <= 15, so 1 <= chunk < 256<<4.
+			// Subtracting 1 in uint32 makes unassigned chunks (0) underflow to
+			// 0xFFFFFFFF, falling through to the length == 0 check below.
+			if chunk-1 < 256<<huffmanValueShift-1 {
 				// Masking wrPos with maxMatchOffset-1 on *[maxMatchOffset]byte
 				// proves the index is in bounds (< 32768) with zero branches.
-				hist[wrPos&(maxMatchOffset-1)] = byte(v)
+				hist[wrPos&(maxMatchOffset-1)] = byte(chunk >> huffmanValueShift)
 				wrPos++
 				if wrPos == maxMatchOffset {
 					exit = exitFlush
@@ -699,17 +697,17 @@ readLiteral:
 				}
 				continue
 			}
-			if v == 256 {
-				exit = exitEndBlock
-				break
-			}
 			// Extract pre-packed lengthBase+3 (bits 17..31) and lengthExtraBits
-			// (bits 13..16) directly from chunk, avoiding secondary array loads
-			// and keeping v's live range confined to the literal/EOB checks above.
-			// Invalid length codes (286, 287) have base == 0.
+			// (bits 13..16) directly from chunk, avoiding secondary array loads.
+			// EOB (256), invalid length codes (286, 287), and unassigned chunks (0)
+			// all have base == 0 (chunk >> 17 == 0).
 			length := int(chunk >> 17)
 			if length == 0 {
-				exit = exitCorrupt
+				if chunk>>huffmanValueShift == 256 {
+					exit = exitEndBlock
+				} else {
+					exit = exitCorrupt
+				}
 				break
 			}
 			n = uint(chunk>>13) & 15
@@ -785,23 +783,21 @@ readLiteral:
 				v := load16(hist, srcPos)
 				if dist < 16 {
 					v = v.PermuteOrZero(distMaskTables[dist&15])
-				}
-				if length > 16 {
-					if dist >= 16 {
-						for {
-							store16(hist, dstPos, v)
-							dstPos += 16
-							srcPos += 16
-							v = load16(hist, srcPos)
-							if endPos-dstPos <= 16 {
-								break
-							}
-						}
-					} else {
+					if length > 16 {
 						step := int(distStep[dist])
 						for endPos-dstPos > 16 {
 							store16(hist, dstPos, v)
 							dstPos += step
+						}
+					}
+				} else if length > 16 {
+					for {
+						store16(hist, dstPos, v)
+						dstPos += 16
+						srcPos += 16
+						v = load16(hist, srcPos)
+						if endPos-dstPos <= 16 {
+							break
 						}
 					}
 				}
