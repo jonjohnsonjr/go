@@ -778,16 +778,16 @@ readLiteral:
 			// of headroom, so it can be done in place with 16-byte vectors.
 			{
 				dstPos := wrPos
-				endPos := dstPos + length
 				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
 				v := load16(hist, srcPos)
 				if dist < 16 {
 					v = v.PermuteOrZero(distMaskTables[dist&15])
 					if length > 16 {
 						step := int(distStep[dist])
-						for endPos-dstPos > 16 {
+						for length > 16 {
 							store16(hist, dstPos, v)
 							dstPos += step
+							length -= step
 						}
 					}
 				} else if length > 16 {
@@ -795,15 +795,16 @@ readLiteral:
 						store16(hist, dstPos, v)
 						dstPos += 16
 						srcPos += 16
+						length -= 16
 						v = load16(hist, srcPos)
-						if endPos-dstPos <= 16 {
+						if length <= 16 {
 							break
 						}
 					}
 				}
 				orig := load16(hist, dstPos)
-				store16(hist, dstPos, v.IfElse(lenMaskTables[(endPos-dstPos)&31], orig))
-				wrPos = endPos
+				store16(hist, dstPos, v.IfElse(lenMaskTables[length&31], orig))
+				wrPos = dstPos + length
 			}
 		}
 
