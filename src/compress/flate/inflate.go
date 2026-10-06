@@ -490,114 +490,201 @@ func (f *decompressor) huffmanBlock() {
 	}
 
 readLiteral:
-	// Read literal and/or (length, distance) according to RFC section 3.2.3.
 	{
-		v, err := f.huffSym(f.hl)
-		if err != nil {
-			f.err = err
-			return
-		}
-		var n uint // number of bits extra
-		var length int
-		switch {
-		case v < 256:
-			f.dict.writeByte(byte(v))
-			if f.dict.availWrite() == 0 {
+		// Optimization: Inlined literal/length Huffman decoding.
+		//
+		// In standard builds, huffSym cannot be inlined by the compiler because its
+		// complexity score (cost 218) exceeds the default inlining budget (80).
+		//
+		// Because literal symbols dominate DEFLATE streams, calling huffSym as a
+		// separate function on every symbol incurs function call overhead and
+		// forces the compiler to repeatedly reload the bit buffer (f.b, f.nb)
+		// from struct memory.
+		//
+		// Inlining the literal decoding path and hoisting the bit buffer state into
+		// local variables (b, nb) keeps the bit buffer in hardware registers
+		// across consecutive literals, only synchronizing back to f.b and f.nb when
+		// yielding or decoding distance symbols (see https://go.dev/cl/227737 for
+		// prior art on decompression loop inlining).
+		b, nb := f.b, f.nb
+		hl := f.hl
+		hlMin := uint(hl.min)
+		r := f.r
+
+		for {
+			n := hlMin
+			var v int
+			for {
+				for nb < n {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint32(c) << (nb & 31)
+					nb += 8
+				}
+				chunk := hl.chunks[b&(huffmanNumChunks-1)]
+				n = uint(chunk & huffmanCountMask)
+				if n > huffmanChunkBits {
+					chunk = hl.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&hl.linkMask]
+					n = uint(chunk & huffmanCountMask)
+				}
+				if n <= nb {
+					if n == 0 {
+						f.b, f.nb = b, nb
+						f.err = CorruptInputError(f.roffset)
+						return
+					}
+					b >>= (n & 31)
+					nb -= n
+					v = int(chunk >> huffmanValueShift)
+					break
+				}
+			}
+
+			if v < 256 {
+				f.dict.writeByte(byte(v))
+				if f.dict.availWrite() == 0 {
+					f.b, f.nb = b, nb
+					f.toRead = f.dict.readFlush()
+					f.step = (*decompressor).huffmanBlock
+					f.stepState = stateInit
+					return
+				}
+				continue
+			}
+
+			if v == 256 {
+				f.b, f.nb = b, nb
+				f.finishBlock()
+				return
+			}
+
+			// Reference to older data
+			var length int
+			var extraBits uint
+			switch {
+			case v < 265:
+				length = v - (257 - 3)
+				extraBits = 0
+			case v < 269:
+				length = v*2 - (265*2 - 11)
+				extraBits = 1
+			case v < 273:
+				length = v*4 - (269*4 - 19)
+				extraBits = 2
+			case v < 277:
+				length = v*8 - (273*8 - 35)
+				extraBits = 3
+			case v < 281:
+				length = v*16 - (277*16 - 67)
+				extraBits = 4
+			case v < 285:
+				length = v*32 - (281*32 - 131)
+				extraBits = 5
+			case v < maxNumLit:
+				length = 258
+				extraBits = 0
+			default:
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			if extraBits > 0 {
+				for nb < extraBits {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint32(c) << (nb & 31)
+					nb += 8
+				}
+				length += int(b & uint32(1<<extraBits-1))
+				b >>= extraBits
+				nb -= extraBits
+			}
+
+			var dist int
+			if f.hd == nil {
+				for nb < 5 {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint32(c) << (nb & 31)
+					nb += 8
+				}
+				dist = int(bits.Reverse8(uint8(b & 0x1F << 3)))
+				b >>= 5
+				nb -= 5
+			} else {
+				f.b, f.nb = b, nb
+				var err error
+				if dist, err = f.huffSym(f.hd); err != nil {
+					f.err = err
+					return
+				}
+				b, nb = f.b, f.nb
+			}
+
+			switch {
+			case dist < 4:
+				dist++
+			case dist < maxNumDist:
+				dnb := uint(dist-2) >> 1
+				extra := (dist & 1) << dnb
+				for nb < dnb {
+					c, err := r.ReadByte()
+					if err != nil {
+						f.b, f.nb = b, nb
+						f.err = noEOF(err)
+						return
+					}
+					f.roffset++
+					b |= uint32(c) << (nb & 31)
+					nb += 8
+				}
+				extra |= int(b & uint32(1<<dnb-1))
+				b >>= dnb
+				nb -= dnb
+				dist = 1<<(dnb+1) + 1 + extra
+			default:
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			if dist > f.dict.histSize() {
+				f.b, f.nb = b, nb
+				f.err = CorruptInputError(f.roffset)
+				return
+			}
+
+			cnt := f.dict.tryWriteCopy(dist, length)
+			if cnt == 0 {
+				cnt = f.dict.writeCopy(dist, length)
+			}
+			length -= cnt
+
+			if f.dict.availWrite() == 0 || length > 0 {
+				f.b, f.nb = b, nb
+				f.copyLen, f.copyDist = length, dist
 				f.toRead = f.dict.readFlush()
 				f.step = (*decompressor).huffmanBlock
-				f.stepState = stateInit
-				return
-			}
-			goto readLiteral
-		case v == 256:
-			f.finishBlock()
-			return
-		// otherwise, reference to older data
-		case v < 265:
-			length = v - (257 - 3)
-			n = 0
-		case v < 269:
-			length = v*2 - (265*2 - 11)
-			n = 1
-		case v < 273:
-			length = v*4 - (269*4 - 19)
-			n = 2
-		case v < 277:
-			length = v*8 - (273*8 - 35)
-			n = 3
-		case v < 281:
-			length = v*16 - (277*16 - 67)
-			n = 4
-		case v < 285:
-			length = v*32 - (281*32 - 131)
-			n = 5
-		case v < maxNumLit:
-			length = 258
-			n = 0
-		default:
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-		if n > 0 {
-			for f.nb < n {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			length += int(f.b & uint32(1<<n-1))
-			f.b >>= n
-			f.nb -= n
-		}
-
-		var dist int
-		if f.hd == nil {
-			for f.nb < 5 {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			dist = int(bits.Reverse8(uint8(f.b & 0x1F << 3)))
-			f.b >>= 5
-			f.nb -= 5
-		} else {
-			if dist, err = f.huffSym(f.hd); err != nil {
-				f.err = err
+				f.stepState = stateDict
 				return
 			}
 		}
-
-		switch {
-		case dist < 4:
-			dist++
-		case dist < maxNumDist:
-			nb := uint(dist-2) >> 1
-			// have 1 bit in bottom of dist, need nb more.
-			extra := (dist & 1) << nb
-			for f.nb < nb {
-				if err = f.moreBits(); err != nil {
-					f.err = err
-					return
-				}
-			}
-			extra |= int(f.b & uint32(1<<nb-1))
-			f.b >>= nb
-			f.nb -= nb
-			dist = 1<<(nb+1) + 1 + extra
-		default:
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-
-		// No check on length; encoding can be prescient.
-		if dist > f.dict.histSize() {
-			f.err = CorruptInputError(f.roffset)
-			return
-		}
-
-		f.copyLen, f.copyDist = length, dist
-		goto copyHistory
 	}
 
 copyHistory:
