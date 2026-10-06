@@ -113,7 +113,7 @@ type huffmanDecoder struct {
 // tree (i.e., neither over-subscribed nor under-subscribed). The exception is a
 // degenerate case where the tree has only a single symbol with length 1. Empty
 // trees are permitted.
-func (h *huffmanDecoder) init(lengths []int) bool {
+func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 	// Sanity enables additional runtime tests during Huffman
 	// table construction. It's intended to be used during
 	// development to supplement the currently ad-hoc unit tests.
@@ -121,6 +121,11 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 
 	if h.min != 0 {
 		*h = huffmanDecoder{}
+	}
+
+	var tmpl []uint32
+	if len(symTemplate) > 0 {
+		tmpl = symTemplate[0]
 	}
 
 	// Count number of codes of each length,
@@ -195,6 +200,9 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 		code := nextcode[n]
 		nextcode[n]++
 		chunk := uint32(i<<huffmanValueShift | n)
+		if i < len(tmpl) {
+			chunk = tmpl[i] | uint32(n)
+		}
 		reverse := int(bits.Reverse16(uint16(code)))
 		reverse >>= uint(16 - n)
 		if n <= huffmanChunkBits {
@@ -457,7 +465,7 @@ func (f *decompressor) readHuffman() error {
 		}
 	}
 
-	if !f.h1.init(f.bits[0:nlit]) || !f.h2.init(f.bits[nlit:nlit+ndist]) {
+	if !f.h1.init(f.bits[0:nlit], litChunkTemplate[:]) || !f.h2.init(f.bits[nlit:nlit+ndist], distChunkTemplate[:]) {
 		return CorruptInputError(f.roffset)
 	}
 
@@ -470,6 +478,56 @@ func (f *decompressor) readHuffman() error {
 	}
 
 	return nil
+}
+
+var distBase = [maxNumDist]uint32{
+	1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+	1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+}
+
+var distExtraBits = [maxNumDist]uint8{
+	0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+	9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+}
+
+var (
+	litChunkTemplate  [maxNumLit + 2]uint32
+	distChunkTemplate [32]uint32
+	fixedDistChunks   [32]uint32
+)
+
+func init() {
+	for i := 0; i < len(litChunkTemplate); i++ {
+		if i < 256 {
+			litChunkTemplate[i] = uint32(i << huffmanValueShift)
+		} else if i == 256 {
+			litChunkTemplate[i] = uint32(256 << huffmanValueShift)
+		} else if i <= 285 {
+			v := i - lengthCodesStart
+			extra := uint32(lengthExtraBits[v])
+			base := uint32(lengthBase[v]) + 3
+			litChunkTemplate[i] = uint32(i<<huffmanValueShift) | (extra << 13) | (base << 17)
+		} else {
+			litChunkTemplate[i] = uint32(i << huffmanValueShift)
+		}
+	}
+	for i := 0; i < len(distChunkTemplate); i++ {
+		if i < maxNumDist {
+			extra := uint32(distExtraBits[i])
+			base := uint32(distBase[i])
+			distChunkTemplate[i] = uint32(i<<huffmanValueShift) | (extra << 13) | (base << 17)
+		} else {
+			distChunkTemplate[i] = uint32(i << huffmanValueShift)
+		}
+	}
+	for raw := 0; raw < 32; raw++ {
+		sym := int(bits.Reverse8(uint8(raw) << 3))
+		if sym < maxNumDist {
+			extra := uint32(distExtraBits[sym])
+			base := uint32(distBase[sym])
+			fixedDistChunks[raw] = uint32(sym<<huffmanValueShift) | (extra << 13) | (base << 17)
+		}
+	}
 }
 
 // Decode a single Huffman block from f.
@@ -519,7 +577,7 @@ readLiteral:
 
 		for {
 			n := hlMin
-			var v int
+			var chunk uint32
 			for {
 				for nb < n {
 					c, err := r.ReadByte()
@@ -533,28 +591,24 @@ readLiteral:
 					b |= uint32(c) << (nb & 31)
 					nb += 8
 				}
-				chunk := hl.chunks[b&(huffmanNumChunks-1)]
+				chunk = hl.chunks[b&(huffmanNumChunks-1)]
 				n = uint(chunk & huffmanCountMask)
 				if n > huffmanChunkBits {
 					chunk = hl.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&hl.linkMask]
 					n = uint(chunk & huffmanCountMask)
 				}
 				if n <= nb {
-					if n == 0 {
-						f.b, f.nb = b, nb
-						f.dict.wrPos = wrPos
-						f.err = CorruptInputError(f.roffset)
-						return
-					}
 					b >>= (n & 31)
 					nb -= n
-					v = int(chunk >> huffmanValueShift)
 					break
 				}
 			}
 
-			if v < 256 {
-				hist[wrPos] = byte(v)
+			// Valid literals (0..255) have 1 <= n <= 15, so 1 <= chunk < 256<<4.
+			// Subtracting 1 in uint32 makes unassigned chunks (0) underflow to
+			// 0xFFFFFFFF, falling through to the length == 0 check below.
+			if chunk-1 < 256<<huffmanValueShift-1 {
+				hist[wrPos] = byte(chunk >> huffmanValueShift)
 				wrPos++
 				if wrPos == maxMatchOffset {
 					f.b, f.nb = b, nb
@@ -567,64 +621,39 @@ readLiteral:
 				continue
 			}
 
-			if v == 256 {
+			// Extract pre-packed lengthBase+3 (bits 17..31) and lengthExtraBits
+			// (bits 13..16) directly from chunk, avoiding secondary array loads.
+			// EOB (256), invalid length codes (286, 287), and unassigned chunks (0)
+			// all have base == 0 (chunk >> 17 == 0).
+			length := int(chunk >> 17)
+			if length == 0 {
 				f.b, f.nb = b, nb
 				f.dict.wrPos = wrPos
-				f.finishBlock()
-				return
-			}
-
-			// Reference to older data
-			var length int
-			var extraBits uint
-			switch {
-			case v < 265:
-				length = v - (257 - 3)
-				extraBits = 0
-			case v < 269:
-				length = v*2 - (265*2 - 11)
-				extraBits = 1
-			case v < 273:
-				length = v*4 - (269*4 - 19)
-				extraBits = 2
-			case v < 277:
-				length = v*8 - (273*8 - 35)
-				extraBits = 3
-			case v < 281:
-				length = v*16 - (277*16 - 67)
-				extraBits = 4
-			case v < 285:
-				length = v*32 - (281*32 - 131)
-				extraBits = 5
-			case v < maxNumLit:
-				length = 258
-				extraBits = 0
-			default:
-				f.b, f.nb = b, nb
-				f.dict.wrPos = wrPos
-				f.err = CorruptInputError(f.roffset)
-				return
-			}
-
-			if extraBits > 0 {
-				for nb < extraBits {
-					c, err := r.ReadByte()
-					if err != nil {
-						f.b, f.nb = b, nb
-						f.dict.wrPos = wrPos
-						f.err = noEOF(err)
-						return
-					}
-					f.roffset++
-					b |= uint32(c) << (nb & 31)
-					nb += 8
+				if chunk>>huffmanValueShift == 256 {
+					f.finishBlock()
+				} else {
+					f.err = CorruptInputError(f.roffset)
 				}
-				length += int(b & uint32(1<<extraBits-1))
-				b >>= extraBits
-				nb -= extraBits
+				return
 			}
+			extraBits := uint(chunk>>13) & 15
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.dict.wrPos = wrPos
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint32(c) << (nb & 31)
+				nb += 8
+			}
+			length += int(b & uint32(1<<extraBits-1))
+			b >>= extraBits
+			nb -= extraBits
 
-			var dist int
+			var dchunk uint32
 			if hd == nil {
 				for nb < 5 {
 					c, err := r.ReadByte()
@@ -638,7 +667,7 @@ readLiteral:
 					b |= uint32(c) << (nb & 31)
 					nb += 8
 				}
-				dist = int(bits.Reverse8(uint8(b & 0x1F << 3)))
+				dchunk = fixedDistChunks[b&0x1f]
 				b >>= 5
 				nb -= 5
 			} else {
@@ -656,55 +685,43 @@ readLiteral:
 						b |= uint32(c) << (nb & 31)
 						nb += 8
 					}
-					chunk := hd.chunks[b&(huffmanNumChunks-1)]
-					n = uint(chunk & huffmanCountMask)
+					dchunk = hd.chunks[b&(huffmanNumChunks-1)]
+					n = uint(dchunk & huffmanCountMask)
 					if n > huffmanChunkBits {
-						chunk = hd.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&hd.linkMask]
-						n = uint(chunk & huffmanCountMask)
+						dchunk = hd.links[dchunk>>huffmanValueShift][(b>>huffmanChunkBits)&hd.linkMask]
+						n = uint(dchunk & huffmanCountMask)
 					}
 					if n <= nb {
-						if n == 0 {
-							f.b, f.nb = b, nb
-							f.dict.wrPos = wrPos
-							f.err = CorruptInputError(f.roffset)
-							return
-						}
 						b >>= (n & 31)
 						nb -= n
-						dist = int(chunk >> huffmanValueShift)
 						break
 					}
 				}
 			}
 
-			switch {
-			case dist < 4:
-				dist++
-			case dist < maxNumDist:
-				dnb := uint(dist-2) >> 1
-				extra := (dist & 1) << dnb
-				for nb < dnb {
-					c, err := r.ReadByte()
-					if err != nil {
-						f.b, f.nb = b, nb
-						f.dict.wrPos = wrPos
-						f.err = noEOF(err)
-						return
-					}
-					f.roffset++
-					b |= uint32(c) << (nb & 31)
-					nb += 8
-				}
-				extra |= int(b & uint32(1<<dnb-1))
-				b >>= dnb
-				nb -= dnb
-				dist = 1<<(dnb+1) + 1 + extra
-			default:
+			dist := int(dchunk >> 17)
+			if dist == 0 {
 				f.b, f.nb = b, nb
 				f.dict.wrPos = wrPos
 				f.err = CorruptInputError(f.roffset)
 				return
 			}
+			extraBits = uint(dchunk>>13) & 15
+			for nb < extraBits {
+				c, err := r.ReadByte()
+				if err != nil {
+					f.b, f.nb = b, nb
+					f.dict.wrPos = wrPos
+					f.err = noEOF(err)
+					return
+				}
+				f.roffset++
+				b |= uint32(c) << (nb & 31)
+				nb += 8
+			}
+			dist += int(b & uint32(1<<extraBits-1))
+			b >>= extraBits
+			nb -= extraBits
 
 			histSize := wrPos
 			if f.dict.full {
@@ -878,7 +895,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 			}
 			f.b = b >> (n & 31)
 			f.nb = nb - n
-			return int(chunk >> huffmanValueShift), nil
+			return int(chunk>>huffmanValueShift) & 0x1ff, nil
 		}
 	}
 }
@@ -915,7 +932,7 @@ func fixedHuffmanDecoderInit() {
 		for i := 280; i < 288; i++ {
 			bits[i] = 8
 		}
-		fixedHuffmanDecoder.init(bits[:])
+		fixedHuffmanDecoder.init(bits[:], litChunkTemplate[:])
 	})
 }
 
