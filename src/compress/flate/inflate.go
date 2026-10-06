@@ -507,9 +507,15 @@ readLiteral:
 		// yielding or decoding distance symbols (see https://go.dev/cl/227737 for
 		// prior art on decompression loop inlining).
 		b, nb := f.b, f.nb
-		hl := f.hl
+		hl, hd := f.hl, f.hd
 		hlMin := uint(hl.min)
+		var hdMin uint
+		if hd != nil {
+			hdMin = uint(hd.min)
+		}
 		r := f.r
+		hist := (*[maxMatchOffset]byte)(f.dict.hist)
+		wrPos := f.dict.wrPos
 
 		for {
 			n := hlMin
@@ -519,6 +525,7 @@ readLiteral:
 					c, err := r.ReadByte()
 					if err != nil {
 						f.b, f.nb = b, nb
+						f.dict.wrPos = wrPos
 						f.err = noEOF(err)
 						return
 					}
@@ -535,6 +542,7 @@ readLiteral:
 				if n <= nb {
 					if n == 0 {
 						f.b, f.nb = b, nb
+						f.dict.wrPos = wrPos
 						f.err = CorruptInputError(f.roffset)
 						return
 					}
@@ -546,9 +554,11 @@ readLiteral:
 			}
 
 			if v < 256 {
-				f.dict.writeByte(byte(v))
-				if f.dict.availWrite() == 0 {
+				hist[wrPos] = byte(v)
+				wrPos++
+				if wrPos == maxMatchOffset {
 					f.b, f.nb = b, nb
+					f.dict.wrPos = wrPos
 					f.toRead = f.dict.readFlush()
 					f.step = (*decompressor).huffmanBlock
 					f.stepState = stateInit
@@ -559,6 +569,7 @@ readLiteral:
 
 			if v == 256 {
 				f.b, f.nb = b, nb
+				f.dict.wrPos = wrPos
 				f.finishBlock()
 				return
 			}
@@ -590,6 +601,7 @@ readLiteral:
 				extraBits = 0
 			default:
 				f.b, f.nb = b, nb
+				f.dict.wrPos = wrPos
 				f.err = CorruptInputError(f.roffset)
 				return
 			}
@@ -599,6 +611,7 @@ readLiteral:
 					c, err := r.ReadByte()
 					if err != nil {
 						f.b, f.nb = b, nb
+						f.dict.wrPos = wrPos
 						f.err = noEOF(err)
 						return
 					}
@@ -612,11 +625,12 @@ readLiteral:
 			}
 
 			var dist int
-			if f.hd == nil {
+			if hd == nil {
 				for nb < 5 {
 					c, err := r.ReadByte()
 					if err != nil {
 						f.b, f.nb = b, nb
+						f.dict.wrPos = wrPos
 						f.err = noEOF(err)
 						return
 					}
@@ -628,13 +642,39 @@ readLiteral:
 				b >>= 5
 				nb -= 5
 			} else {
-				f.b, f.nb = b, nb
-				var err error
-				if dist, err = f.huffSym(f.hd); err != nil {
-					f.err = err
-					return
+				n := hdMin
+				for {
+					for nb < n {
+						c, err := r.ReadByte()
+						if err != nil {
+							f.b, f.nb = b, nb
+							f.dict.wrPos = wrPos
+							f.err = noEOF(err)
+							return
+						}
+						f.roffset++
+						b |= uint32(c) << (nb & 31)
+						nb += 8
+					}
+					chunk := hd.chunks[b&(huffmanNumChunks-1)]
+					n = uint(chunk & huffmanCountMask)
+					if n > huffmanChunkBits {
+						chunk = hd.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&hd.linkMask]
+						n = uint(chunk & huffmanCountMask)
+					}
+					if n <= nb {
+						if n == 0 {
+							f.b, f.nb = b, nb
+							f.dict.wrPos = wrPos
+							f.err = CorruptInputError(f.roffset)
+							return
+						}
+						b >>= (n & 31)
+						nb -= n
+						dist = int(chunk >> huffmanValueShift)
+						break
+					}
 				}
-				b, nb = f.b, f.nb
 			}
 
 			switch {
@@ -647,6 +687,7 @@ readLiteral:
 					c, err := r.ReadByte()
 					if err != nil {
 						f.b, f.nb = b, nb
+						f.dict.wrPos = wrPos
 						f.err = noEOF(err)
 						return
 					}
@@ -660,23 +701,31 @@ readLiteral:
 				dist = 1<<(dnb+1) + 1 + extra
 			default:
 				f.b, f.nb = b, nb
+				f.dict.wrPos = wrPos
 				f.err = CorruptInputError(f.roffset)
 				return
 			}
 
-			if dist > f.dict.histSize() {
+			histSize := wrPos
+			if f.dict.full {
+				histSize = maxMatchOffset
+			}
+			if dist > histSize {
 				f.b, f.nb = b, nb
+				f.dict.wrPos = wrPos
 				f.err = CorruptInputError(f.roffset)
 				return
 			}
 
+			f.dict.wrPos = wrPos
 			cnt := f.dict.tryWriteCopy(dist, length)
 			if cnt == 0 {
 				cnt = f.dict.writeCopy(dist, length)
 			}
+			wrPos = f.dict.wrPos
 			length -= cnt
 
-			if f.dict.availWrite() == 0 || length > 0 {
+			if wrPos == maxMatchOffset || length > 0 {
 				f.b, f.nb = b, nb
 				f.copyLen, f.copyDist = length, dist
 				f.toRead = f.dict.readFlush()
