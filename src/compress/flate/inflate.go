@@ -11,10 +11,8 @@ import (
 	"bufio"
 	"io"
 	"math/bits"
-	"simd/archsimd"
 	"strconv"
 	"sync"
-	"unsafe"
 )
 
 const (
@@ -591,19 +589,6 @@ func (f *decompressor) huffmanBlock() {
 	}
 }
 
-// The preceding wrPos+length+16 / dist bounds checks guarantee
-// 0 <= i <= maxMatchOffset-16, and using LoadUint8x16Array/StoreArray via
-// unsafe.Add avoids the 40+ instructions of slice creation, Spectre slice-base
-// masking, and (*[16]byte)(slice) length checks without bumping dd.hist out
-// of Go's 32 KB malloc size class.
-func load16(p *[maxMatchOffset]byte, i int) archsimd.Uint8x16 {
-	return archsimd.LoadUint8x16Array((*[16]byte)(unsafe.Add(unsafe.Pointer(p), i)))
-}
-
-func store16(p *[maxMatchOffset]byte, i int, v archsimd.Uint8x16) {
-	v.StoreArray((*[16]byte)(unsafe.Add(unsafe.Pointer(p), i)))
-}
-
 // huffmanBlockPeek decodes a Huffman block using a 64-bit bit buffer refilled
 // 8 bytes at a time from peekable readers (f.pr != nil).
 func (f *decompressor) huffmanBlockPeek() {
@@ -764,24 +749,40 @@ readLiteral:
 				// both slices are contiguous and disjoint (with dist >= 19 > 16),
 				// so the 16-byte SIMD copy below can handle it in place without
 				// bailing out of the fast loop.
-				if wrPos+length+16 > dist || dist+length+16 > maxMatchOffset {
+				if !haveSIMD || wrPos+length+16 > dist || dist+length+16 > maxMatchOffset {
 					f.copyLen, f.copyDist = length, dist
 					exit = exitCopy
 					break
 				}
-			} else if wrPos+length+16 > maxMatchOffset {
+			} else if !haveSIMD || wrPos+length+16 > maxMatchOffset {
 				f.copyLen, f.copyDist = length, dist
 				exit = exitCopy
 				break
 			}
 			// Common case: the copy fits in the window with at least 16 bytes
-			// of headroom, so it can be done in place with 16-byte vectors.
+			// of headroom and SIMD is available, so it can be done in place with
+			// 16-byte vectors.
+			//
+			// Why this block is kept in huffmanBlockPeek using leaf helpers
+			// (load16, store16, permuteDist16, blendStore16) rather than a single
+			// helper function: Go's inliner has a cost budget of 80, and
+			// blendStore16 alone costs 55 (because archsimd.Uint8x16.IfElse is a
+			// Go wrapper method). Putting the bounds checks, loops, and vector
+			// ops into a single function would exceed the inlining budget and
+			// emit a real CALL on every match, spilling the hot loop's register
+			// state (b, nb, pi, wrPos) to the stack.
+			//
+			// On arm64, haveSIMD is const true; without GOEXPERIMENT=simd (or on
+			// other architectures), haveSIMD is const false and the compiler
+			// dead-code-eliminates this block; on amd64, haveSIMD checks
+			// archsimd.X86.AVX() at runtime so GOAMD64=v1 builds safely fall back
+			// on CPUs without AVX.
 			{
 				dstPos := wrPos
 				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
 				v := load16(hist, srcPos)
 				if dist < 16 {
-					v = v.PermuteOrZero(distMaskTables[dist&15])
+					v = permuteDist16(v, dist)
 					if length > 16 {
 						step := int(distStep[dist])
 						for length > 16 {
@@ -802,8 +803,7 @@ readLiteral:
 						}
 					}
 				}
-				orig := load16(hist, dstPos)
-				store16(hist, dstPos, v.IfElse(lenMaskTables[length&31], orig))
+				blendStore16(hist, dstPos, v, length)
 				wrPos = dstPos + length
 			}
 		}
