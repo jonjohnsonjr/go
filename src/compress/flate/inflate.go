@@ -104,7 +104,7 @@ const (
 type huffmanDecoder struct {
 	min      int                      // the minimum code length
 	chunks   [huffmanNumChunks]uint32 // chunks as described above
-	links    [][]uint32               // overflow links
+	links    []uint32                 // flat overflow links
 	linkMask uint32                   // mask the width of the link table
 }
 
@@ -118,10 +118,6 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 	// table construction. It's intended to be used during
 	// development to supplement the currently ad-hoc unit tests.
 	const sanity = false
-
-	if h.min != 0 {
-		*h = huffmanDecoder{}
-	}
 
 	var tmpl []uint32
 	if len(symTemplate) > 0 {
@@ -153,6 +149,10 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 	// guaranteed to fail later since the compressed data section must be
 	// composed of at least one symbol (the end-of-block marker).
 	if max == 0 {
+		if h.min != 0 {
+			clear(h.chunks[:])
+			h.min = 0
+		}
 		return true
 	}
 
@@ -173,6 +173,13 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 		return false
 	}
 
+	if code == 1 && max == 1 {
+		clear(h.chunks[:])
+	}
+	if sanity {
+		clear(h.chunks[:])
+	}
+
 	h.min = min
 	if max > huffmanChunkBits {
 		numLinks := 1 << (uint(max) - huffmanChunkBits)
@@ -180,16 +187,25 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 
 		// create link tables
 		link := nextcode[huffmanChunkBits+1] >> 1
-		h.links = make([][]uint32, huffmanNumChunks-link)
+		nLinks := huffmanNumChunks - link
+		totalLinks := nLinks * numLinks
+		if cap(h.links) < totalLinks {
+			h.links = make([]uint32, totalLinks)
+		} else {
+			h.links = h.links[:totalLinks]
+			if sanity {
+				clear(h.links)
+			}
+		}
 		for j := uint(link); j < huffmanNumChunks; j++ {
 			reverse := int(bits.Reverse16(uint16(j)))
 			reverse >>= uint(16 - huffmanChunkBits)
 			off := j - uint(link)
+			base := off * uint(numLinks)
 			if sanity && h.chunks[reverse] != 0 {
 				panic("impossible: overwriting existing chunk")
 			}
-			h.chunks[reverse] = uint32(off<<huffmanValueShift | (huffmanChunkBits + 1))
-			h.links[off] = make([]uint32, numLinks)
+			h.chunks[reverse] = uint32(base<<huffmanValueShift | (huffmanChunkBits + 1))
 		}
 	}
 
@@ -224,14 +240,15 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 				// associated with a link table above.
 				panic("impossible: not an indirect chunk")
 			}
-			value := h.chunks[j] >> huffmanValueShift
-			linktab := h.links[value]
+			base := h.chunks[j] >> huffmanValueShift
 			reverse >>= huffmanChunkBits
-			for off := reverse; off < len(linktab); off += 1 << uint(n-huffmanChunkBits) {
-				if sanity && linktab[off] != 0 {
+			step := 1 << uint(n-huffmanChunkBits)
+			numLinks := int(h.linkMask + 1)
+			for off := reverse; off < numLinks; off += step {
+				if sanity && h.links[base+uint32(off)] != 0 {
 					panic("impossible: overwriting existing chunk")
 				}
-				linktab[off] = chunk
+				h.links[base+uint32(off)] = chunk
 			}
 		}
 	}
@@ -251,11 +268,9 @@ func (h *huffmanDecoder) init(lengths []int, symTemplate ...[]uint32) bool {
 				panic("impossible: missing chunk")
 			}
 		}
-		for _, linktab := range h.links {
-			for _, chunk := range linktab {
-				if chunk == 0 {
-					panic("impossible: missing chunk")
-				}
+		for _, chunk := range h.links {
+			if chunk == 0 {
+				panic("impossible: missing chunk")
 			}
 		}
 	}
@@ -594,7 +609,7 @@ readLiteral:
 				chunk = hl.chunks[b&(huffmanNumChunks-1)]
 				n = uint(chunk & huffmanCountMask)
 				if n > huffmanChunkBits {
-					chunk = hl.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&hl.linkMask]
+					chunk = hl.links[(chunk>>huffmanValueShift)|((b>>huffmanChunkBits)&hl.linkMask)]
 					n = uint(chunk & huffmanCountMask)
 				}
 				if n <= nb {
@@ -688,7 +703,7 @@ readLiteral:
 					dchunk = hd.chunks[b&(huffmanNumChunks-1)]
 					n = uint(dchunk & huffmanCountMask)
 					if n > huffmanChunkBits {
-						dchunk = hd.links[dchunk>>huffmanValueShift][(b>>huffmanChunkBits)&hd.linkMask]
+						dchunk = hd.links[(dchunk>>huffmanValueShift)|((b>>huffmanChunkBits)&hd.linkMask)]
 						n = uint(dchunk & huffmanCountMask)
 					}
 					if n <= nb {
@@ -955,7 +970,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 		chunk := h.chunks[b&(huffmanNumChunks-1)]
 		n = uint(chunk & huffmanCountMask)
 		if n > huffmanChunkBits {
-			chunk = h.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&h.linkMask]
+			chunk = h.links[(chunk>>huffmanValueShift)|((b>>huffmanChunkBits)&h.linkMask)]
 			n = uint(chunk & huffmanCountMask)
 		}
 		if n <= nb {
@@ -1013,6 +1028,8 @@ func (f *decompressor) Reset(r io.Reader, dict []byte) error {
 		rBuf:     f.rBuf,
 		bits:     f.bits,
 		codebits: f.codebits,
+		h1:       huffmanDecoder{links: f.h1.links},
+		h2:       huffmanDecoder{links: f.h2.links},
 		dict:     f.dict,
 		step:     (*decompressor).nextBlock,
 	}
