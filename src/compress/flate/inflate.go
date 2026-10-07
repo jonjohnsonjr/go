@@ -734,6 +734,64 @@ readLiteral:
 				return
 			}
 
+			// Fast path: copy the LZ77 match in place using 16-byte SIMD vectors
+			// when SIMD is available and both source and destination have at least
+			// 16 bytes of contiguous headroom in the 32 KB window.
+			//
+			// Why this block is kept in huffmanBlock using leaf helpers (load16,
+			// store16, permuteDist16, blendStore16) rather than a single helper
+			// function: Go's inliner has a cost budget of 80, and blendStore16
+			// alone costs 55 (because archsimd.Uint8x16.IfElse is a Go wrapper
+			// method). Putting the bounds checks, loops, and vector ops into a
+			// single function would exceed the inlining budget and emit a real
+			// CALL on every match, spilling the hot loop's register state
+			// (b, nb, wrPos) to the stack.
+			//
+			// On arm64, haveSIMD is const true; without GOEXPERIMENT=simd (or on
+			// other architectures), haveSIMD is const false and the compiler
+			// dead-code-eliminates this entire block; on amd64, haveSIMD checks
+			// archsimd.X86.AVX() at runtime so GOAMD64=v1 builds safely fall back
+			// on CPUs without AVX.
+			if !haveSIMD {
+				goto fallbackCopy
+			}
+
+			if wrPos >= dist && wrPos+length+16 <= maxMatchOffset {
+				dstPos := wrPos
+				srcPos := dstPos - dist
+				v := load16(hist, srcPos)
+				if dist < 16 {
+					v = permuteDist16(v, dist)
+					if length > 16 {
+						step := int(distStep[dist])
+						for length > 16 {
+							store16(hist, dstPos, v)
+							dstPos += step
+							length -= step
+						}
+					}
+				} else if length > 16 {
+					for {
+						store16(hist, dstPos, v)
+						dstPos += 16
+						srcPos += 16
+						v = load16(hist, srcPos)
+						length -= 16
+						if length <= 16 {
+							break
+						}
+					}
+				}
+				blendStore16(hist, dstPos, v, length)
+				wrPos = dstPos + length
+				continue
+			}
+
+		fallbackCopy:
+			// Scalar fallback for matches near the 32 KB window boundary (within
+			// 16 bytes of the end or straddling the wrap-around point) or when
+			// SIMD is unavailable. Kept in-loop so matches that don't fill the
+			// 32 KB window continue decoding without flushing (b, nb) to f.
 			f.dict.wrPos = wrPos
 			cnt := f.dict.tryWriteCopy(dist, length)
 			if cnt == 0 {
