@@ -756,9 +756,23 @@ readLiteral:
 				goto fallbackCopy
 			}
 
-			if wrPos >= dist && wrPos+length+16 <= maxMatchOffset {
+			if dist > wrPos {
+				// Circular-window wrap-around: after the first 32 KB flush
+				// (f.dict.full), matches near the start of the window can reference
+				// the end of hist at srcPos = maxMatchOffset + wrPos - dist. As long
+				// as neither source nor destination crosses the end of hist or
+				// overlaps (wrPos+length+16 <= dist && dist+length+16 <= maxMatchOffset),
+				// both regions are contiguous and disjoint with dist >= 19 > 16.
+				if wrPos+length+16 > dist || dist+length+16 > maxMatchOffset {
+					goto fallbackCopy
+				}
+			} else if wrPos+length+16 > maxMatchOffset {
+				goto fallbackCopy
+			}
+
+			{
 				dstPos := wrPos
-				srcPos := dstPos - dist
+				srcPos := (dstPos - dist) & (maxMatchOffset - 1)
 				v := load16(hist, srcPos)
 				if dist < 16 {
 					v = permuteDist16(v, dist)
